@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WeCom (ä¼ä¸å¾®ä¿¡) â Coze AI æ¡¥æ¥æå¡
+WeCom (Ã¤Â¼ÂÃ¤Â¸ÂÃ¥Â¾Â®Ã¤Â¿Â¡) Ã¢ÂÂ Coze AI Ã¦Â¡Â¥Ã¦ÂÂ¥Ã¦ÂÂÃ¥ÂÂ¡
 """
 import hashlib, time, json, struct, base64, random, string, socket, logging, requests, threading
 from flask import Flask, request
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ========== éç½® ==========
+# ========== Ã©ÂÂÃ§Â½Â® ==========
 WECOM_TOKEN            = "OXrbKRCZP16i6lFbBQtu"
 WECOM_ENCODING_AES_KEY = "F82YtGahbT4TC3ntZxv5PbjlqeI1MtZdAfNi5TIsrxi"
 WECOM_CORP_ID          = "ww1250414ed84f6f22"
@@ -28,16 +28,25 @@ AES_KEY = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
 
 def _pkcs7_unpad(data):
     pad = data[-1]
+    if pad == 0 or pad > 32:
+        raise ValueError(f"Invalid PKCS7 pad byte: {pad}, last8: {data[-8:].hex()}")
     return data[:-pad]
 
 def wecom_decrypt(encrypt_b64):
     encrypt_b64 = encrypt_b64.replace(" ", "+")
+    logger.info(f"[DEBUG] echostr first30={encrypt_b64[:30]!r} last10={encrypt_b64[-10:]!r} total_len={len(encrypt_b64)}")
     raw = base64.b64decode(encrypt_b64)
+    logger.info(f"[DEBUG] raw_bytes_len={len(raw)}")
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_KEY[:16])
-    plain = _pkcs7_unpad(cipher.decrypt(raw))
+    decrypted = cipher.decrypt(raw)
+    logger.info(f"[DEBUG] decrypted_len={len(decrypted)} last8_hex={decrypted[-8:].hex()} pad_byte={decrypted[-1]}")
+    plain = _pkcs7_unpad(decrypted)
+    logger.info(f"[DEBUG] after_unpad_len={len(plain)} first20_hex={plain[:20].hex() if plain else 'EMPTY'}")
     plain = plain[16:]
-    msg_len = struct.unpack(">I", plain[:4])[0]
-    return plain[4:4 + msg_len].decode("utf-8")
+    logger.info(f"[DEBUG] after_skip16_len={len(plain)} first8_hex={plain[:8].hex() if len(plain) >= 8 else plain.hex()}")
+    msg_len = struct.unpack(\">I\", plain[:4])[0]
+    logger.info(f"[DEBUG] msg_len={msg_len}")
+    return plain[4:4 + msg_len].decode(\"utf-8\")
 
 def wecom_encrypt(plain_text):
     plain_text = plain_text.encode("utf-8")
@@ -62,7 +71,7 @@ def send_message(to_user, content):
     payload = {"touser": to_user, "msgtype": "text",
                "agentid": WECOM_AGENT_ID, "text": {"content": content}}
     r = requests.post(url, json=payload, timeout=10).json()
-    logger.info(f"åéç»æ: {r}")
+    logger.info(f"Ã¥ÂÂÃ©ÂÂÃ§Â»ÂÃ¦ÂÂ: {r}")
 
 def ask_coze(question, user_id):
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
@@ -73,8 +82,8 @@ def ask_coze(question, user_id):
     }
     resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30).json()
     if resp.get("code") != 0:
-        logger.error(f"Cozeéè¯¯: {resp}")
-        return "æ±æ­ï¼AIå©æææ¶æ æ³åå¤ï¼è¯·èç³»åºé¿ã"
+        logger.error(f"CozeÃ©ÂÂÃ¨Â¯Â¯: {resp}")
+        return "Ã¦ÂÂ±Ã¦Â­ÂÃ¯Â¼ÂAIÃ¥ÂÂ©Ã¦ÂÂÃ¦ÂÂÃ¦ÂÂ¶Ã¦ÂÂ Ã¦Â³ÂÃ¥ÂÂÃ¥Â¤ÂÃ¯Â¼ÂÃ¨Â¯Â·Ã¨ÂÂÃ§Â³Â»Ã¥ÂºÂÃ©ÂÂ¿Ã£ÂÂ"
 
     chat_id = resp["data"]["id"]
     conv_id = resp["data"]["conversation_id"]
@@ -91,12 +100,12 @@ def ask_coze(question, user_id):
                 headers=headers, timeout=10).json()
             for m in msgs.get("data", []):
                 if m.get("role") == "assistant" and m.get("type") == "answer":
-                    return m.get("content", "æ æ³è·ååå¤")
+                    return m.get("content", "Ã¦ÂÂ Ã¦Â³ÂÃ¨ÂÂ·Ã¥ÂÂÃ¥ÂÂÃ¥Â¤Â")
             break
         elif status in ("failed", "cancelled"):
             break
 
-    return "AIå¤çè¶æ¶ï¼è¯·ç¨ååè¯æèç³»åºé¿ã"
+    return "AIÃ¥Â¤ÂÃ§ÂÂÃ¨Â¶ÂÃ¦ÂÂ¶Ã¯Â¼ÂÃ¨Â¯Â·Ã§Â¨ÂÃ¥ÂÂÃ¥ÂÂÃ¨Â¯ÂÃ¦ÂÂÃ¨ÂÂÃ§Â³Â»Ã¥ÂºÂÃ©ÂÂ¿Ã£ÂÂ"
 
 @app.route("/health")
 def health():
@@ -104,7 +113,7 @@ def health():
 
 @app.route("/test")
 def test_public():
-    return "OK - æå¡è¿è¡æ­£å¸¸", 200
+    return "OK - Ã¦ÂÂÃ¥ÂÂ¡Ã¨Â¿ÂÃ¨Â¡ÂÃ¦Â­Â£Ã¥Â¸Â¸", 200
 
 @app.route("/wecom", methods=["GET", "POST"])
 def wecom():
@@ -114,14 +123,14 @@ def wecom():
 
     if request.method == "GET":
         echostr = request.args.get("echostr", "")
-        logger.info(f"[éªè¯] WeComéªè¯è¯·æ±å°è¾¾! echostré¿åº¦={len(echostr)}")
+        logger.info(f"[Ã©ÂªÂÃ¨Â¯Â] WeComÃ©ÂªÂÃ¨Â¯ÂÃ¨Â¯Â·Ã¦Â±ÂÃ¥ÂÂ°Ã¨Â¾Â¾! echostrÃ©ÂÂ¿Ã¥ÂºÂ¦={len(echostr)}")
         try:
             plain = wecom_decrypt(echostr)
-            logger.info(f"[éªè¯] è§£å¯æå")
+            logger.info(f"[Ã©ÂªÂÃ¨Â¯Â] Ã¨Â§Â£Ã¥Â¯ÂÃ¦ÂÂÃ¥ÂÂ")
             return plain
         except Exception as e:
-            logger.exception(f"[éªè¯] è§£å¯å¤±è´¥: {e}")
-            return "è§£å¯éè¯¯", 500
+            logger.exception(f"[Ã©ÂªÂÃ¨Â¯Â] Ã¨Â§Â£Ã¥Â¯ÂÃ¥Â¤Â±Ã¨Â´Â¥: {e}")
+            return "Ã¨Â§Â£Ã¥Â¯ÂÃ©ÂÂÃ¨Â¯Â¯", 500
 
     if request.method == "POST":
         import xml.etree.ElementTree as ET
@@ -134,13 +143,13 @@ def wecom():
             from_user = msg.find("FromUserName").text
             if msg_type == "text":
                 content = msg.find("Content").text.strip()
-                logger.info(f"[æ¶æ¯] {from_user}: {content}")
+                logger.info(f"[Ã¦Â¶ÂÃ¦ÂÂ¯] {from_user}: {content}")
                 def reply():
                     answer = ask_coze(content, from_user)
                     send_message(from_user, answer)
                 threading.Thread(target=reply, daemon=True).start()
         except Exception as e:
-            logger.exception(f"å¤çæ¶æ¯å¤±è´¥: {e}")
+            logger.exception(f"Ã¥Â¤ÂÃ§ÂÂÃ¦Â¶ÂÃ¦ÂÂ¯Ã¥Â¤Â±Ã¨Â´Â¥: {e}")
         return "success"
 
 if __name__ == "__main__":
