@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-WeCom (企业微信) ↔ Coze AI 桥接服务
+WeCom (ä¼ä¸å¾®ä¿¡) â Coze AI æ¡¥æ¥æå¡
 """
 import hashlib, time, json, struct, base64, random, string, socket, logging, requests, threading
 from flask import Flask, request
@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ========== 配置 ==========
+# ========== éç½® ==========
 WECOM_TOKEN            = "OXrbKRCZP16i6lFbBQtu"
 WECOM_ENCODING_AES_KEY = "F82YtGahbT4TC3ntZxv5PbjlqeI1MtZdAfNi5TIsrxi"
 WECOM_CORP_ID          = "ww1250414ed84f6f22"
@@ -31,6 +31,7 @@ def _pkcs7_unpad(data):
     return data[:-pad]
 
 def wecom_decrypt(encrypt_b64):
+    encrypt_b64 = encrypt_b64.replace(" ", "+")
     raw = base64.b64decode(encrypt_b64)
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_KEY[:16])
     plain = _pkcs7_unpad(cipher.decrypt(raw))
@@ -61,7 +62,7 @@ def send_message(to_user, content):
     payload = {"touser": to_user, "msgtype": "text",
                "agentid": WECOM_AGENT_ID, "text": {"content": content}}
     r = requests.post(url, json=payload, timeout=10).json()
-    logger.info(f"发送结果: {r}")
+    logger.info(f"åéç»æ: {r}")
 
 def ask_coze(question, user_id):
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
@@ -72,8 +73,8 @@ def ask_coze(question, user_id):
     }
     resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30).json()
     if resp.get("code") != 0:
-        logger.error(f"Coze错误: {resp}")
-        return "抱歉，AI助手暂时无法回复，请联系店长。"
+        logger.error(f"Cozeéè¯¯: {resp}")
+        return "æ±æ­ï¼AIå©æææ¶æ æ³åå¤ï¼è¯·èç³»åºé¿ã"
 
     chat_id = resp["data"]["id"]
     conv_id = resp["data"]["conversation_id"]
@@ -90,12 +91,12 @@ def ask_coze(question, user_id):
                 headers=headers, timeout=10).json()
             for m in msgs.get("data", []):
                 if m.get("role") == "assistant" and m.get("type") == "answer":
-                    return m.get("content", "无法获取回复")
+                    return m.get("content", "æ æ³è·ååå¤")
             break
         elif status in ("failed", "cancelled"):
             break
 
-    return "AI处理超时，请稍后再试或联系店长。"
+    return "AIå¤çè¶æ¶ï¼è¯·ç¨ååè¯æèç³»åºé¿ã"
 
 @app.route("/health")
 def health():
@@ -103,7 +104,7 @@ def health():
 
 @app.route("/test")
 def test_public():
-    return "OK - 服务运行正常", 200
+    return "OK - æå¡è¿è¡æ­£å¸¸", 200
 
 @app.route("/wecom", methods=["GET", "POST"])
 def wecom():
@@ -113,14 +114,14 @@ def wecom():
 
     if request.method == "GET":
         echostr = request.args.get("echostr", "")
-        logger.info(f"[验证] WeCom验证请求到达! echostr长度={len(echostr)}")
+        logger.info(f"[éªè¯] WeComéªè¯è¯·æ±å°è¾¾! echostré¿åº¦={len(echostr)}")
         try:
             plain = wecom_decrypt(echostr)
-            logger.info(f"[验证] 解密成功")
+            logger.info(f"[éªè¯] è§£å¯æå")
             return plain
         except Exception as e:
-            logger.exception(f"[验证] 解密失败: {e}")
-            return "解密错误", 500
+            logger.exception(f"[éªè¯] è§£å¯å¤±è´¥: {e}")
+            return "è§£å¯éè¯¯", 500
 
     if request.method == "POST":
         import xml.etree.ElementTree as ET
@@ -133,13 +134,13 @@ def wecom():
             from_user = msg.find("FromUserName").text
             if msg_type == "text":
                 content = msg.find("Content").text.strip()
-                logger.info(f"[消息] {from_user}: {content}")
+                logger.info(f"[æ¶æ¯] {from_user}: {content}")
                 def reply():
                     answer = ask_coze(content, from_user)
                     send_message(from_user, answer)
                 threading.Thread(target=reply, daemon=True).start()
         except Exception as e:
-            logger.exception(f"处理消息失败: {e}")
+            logger.exception(f"å¤çæ¶æ¯å¤±è´¥: {e}")
         return "success"
 
 if __name__ == "__main__":
