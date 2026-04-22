@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
-"""
-WeCom <-> Coze AI bridge
-同步回复模式：直接在callback中返回加密XML，不需要IP白名单
-"""
+"""WeCom <-> Coze AI bridge — async reply via WeCom API"""
 
-import hashlib, time, json, struct, base64, random, string, logging, requests, os
-from flask import Flask, request, Response
+import hashlib, time, json, struct, base64, random, string, logging, requests, threading, os
+from flask import Flask, request
 from Crypto.Cipher import AES
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -34,10 +31,6 @@ def _pkcs7_unpad(data):
         raise ValueError(f"Invalid pad: {pad}")
     return data[:-pad]
 
-def _pkcs7_pad(data):
-    pad_len = 32 - len(data) % 32
-    return data + bytes([pad_len] * pad_len)
-
 def wecom_decrypt(encrypt_b64):
     encrypt_b64 = encrypt_b64.replace(" ", "+")
     raw = base64.b64decode(encrypt_b64)
@@ -47,49 +40,33 @@ def wecom_decrypt(encrypt_b64):
     msg_len = struct.unpack(">I", plain[:4])[0]
     return plain[4:4 + msg_len].decode("utf-8")
 
-def wecom_encrypt(plain_text):
-    rand = ''.join(random.choices(string.ascii_letters + string.digits, k=16)).encode()
-    plain_bytes = plain_text.encode("utf-8")
-    msg_len = struct.pack(">I", len(plain_bytes))
-    content = rand + msg_len + plain_bytes + WECOM_CORP_ID.encode()
-    padded = _pkcs7_pad(content)
-    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_KEY[:16])
-    return base64.b64encode(cipher.encrypt(padded)).decode()
+# ---------- WeCom API ----------
+_token_cache = {"token": "", "expires": 0}
 
-def wecom_sign(*args):
-    return hashlib.sha1("".join(sorted(args)).encode()).hexdigest()
+def get_access_token():
+    if time.time() < _token_cache["expires"] - 60:
+        return _token_cache["token"]
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}"
+    r = requests.get(url, timeout=10).json()
+    if r.get("errcode", 0) == 0:
+        _token_cache["token"] = r["access_token"]
+        _token_cache["expires"] = time.time() + r["expires_in"]
+        logger.info("[TOKEN] refreshed")
+    else:
+        logger.error(f"[TOKEN] error: {r}")
+    return _token_cache["token"]
 
-# ---------- Build encrypted reply ----------
-def build_sync_reply(from_user, to_user, content):
-    """Build encrypted WeCom XML reply (no API call, no IP whitelist needed)"""
-    ts = str(int(time.time()))
-    nonce = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
-
-    plain_xml = (
-        f"<xml>"
-        f"<ToUserName><![CDATA[{from_user}]]></ToUserName>"
-        f"<FromUserName><![CDATA[{to_user}]]></FromUserName>"
-        f"<CreateTime>{ts}</CreateTime>"
-        f"<MsgType><![CDATA[text]]></MsgType>"
-        f"<Content><![CDATA[{content}]]></Content>"
-        f"</xml>"
-    )
-
-    encrypt = wecom_encrypt(plain_xml)
-    sign = wecom_sign(WECOM_TOKEN, ts, nonce, encrypt)
-
-    reply_xml = (
-        f"<xml>"
-        f"<Encrypt><![CDATA[{encrypt}]]></Encrypt>"
-        f"<MsgSignature><![CDATA[{sign}]]></MsgSignature>"
-        f"<TimeStamp>{ts}</TimeStamp>"
-        f"<Nonce><![CDATA[{nonce}]]></Nonce>"
-        f"</xml>"
-    )
-    return Response(reply_xml, content_type="application/xml")
+def send_message(to_user, content):
+    token = get_access_token()
+    url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
+    payload = {"touser": to_user, "msgtype": "text",
+               "agentid": WECOM_AGENT_ID, "text": {"content": content}}
+    r = requests.post(url, json=payload, timeout=10).json()
+    logger.info(f"[SEND] {r}")
+    return r
 
 # ---------- Coze API ----------
-def ask_coze(question, user_id, timeout=25):
+def ask_coze(question, user_id):
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
     body = {
         "bot_id": COZE_BOT_ID,
@@ -99,23 +76,19 @@ def ask_coze(question, user_id, timeout=25):
         "additional_messages": [{"role": "user", "content": question, "content_type": "text"}]
     }
     try:
-        resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=timeout, stream=True)
+        resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30, stream=True)
         if resp.status_code != 200:
-            logger.error(f"[COZE] HTTP {resp.status_code}: {resp.text[:300]}")
+            logger.error(f"[COZE] HTTP {resp.status_code}: {resp.text[:200]}")
             return None
-
         answer = ""
         current_event = ""
-
         for raw_line in resp.iter_lines():
             if not raw_line:
                 continue
             line = raw_line.decode("utf-8")
-
             if line.startswith("event:"):
                 current_event = line[6:].strip()
                 continue
-
             if line.startswith("data:"):
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
@@ -132,45 +105,27 @@ def ask_coze(question, user_id, timeout=25):
                             logger.info(f"[COZE] answer len={len(answer)}")
                 except Exception:
                     pass
-
         return answer if answer else None
-
-    except requests.exceptions.Timeout:
-        logger.warning("[COZE] timeout")
-        return None
     except Exception as e:
         logger.exception(f"[COZE] error: {e}")
         return None
 
-# ---------- WeCom token + send (fallback only) ----------
-_token_cache = {"token": "", "expires": 0}
+# ---------- Deduplication ----------
+_seen_msgs = {}
+_seen_lock = threading.Lock()
 
-def get_access_token():
-    if time.time() < _token_cache["expires"] - 60:
-        return _token_cache["token"]
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}"
-    r = requests.get(url, timeout=10).json()
-    if r.get("errcode", 0) == 0:
-        _token_cache["token"] = r["access_token"]
-        _token_cache["expires"] = time.time() + r["expires_in"]
-        logger.info("[TOKEN] refreshed")
-    else:
-        logger.error(f"[TOKEN] error: {r}")
-    return _token_cache["token"]
-
-def send_message_api(to_user, content):
-    """Fallback: send via WeCom API (requires IP whitelist)"""
-    try:
-        token = get_access_token()
-        url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-        payload = {"touser": to_user, "msgtype": "text",
-                   "agentid": WECOM_AGENT_ID, "text": {"content": content}}
-        r = requests.post(url, json=payload, timeout=10).json()
-        logger.info(f"[SEND] {r}")
-        return r
-    except Exception as e:
-        logger.error(f"[SEND] error: {e}")
-        return None
+def is_duplicate(msg_id):
+    """Return True if we already processed this message ID"""
+    now = time.time()
+    with _seen_lock:
+        # Clean old entries (>60s)
+        for k in list(_seen_msgs.keys()):
+            if now - _seen_msgs[k] > 60:
+                del _seen_msgs[k]
+        if msg_id in _seen_msgs:
+            return True
+        _seen_msgs[msg_id] = now
+        return False
 
 # ---------- Routes ----------
 @app.route("/health")
@@ -199,25 +154,22 @@ def diag():
     except Exception as e:
         result["token_err"] = str(e)
     result["coze_key_prefix"] = COZE_API_KEY[:12] + "..."
-    result["reply_mode"] = "sync_xml (no IP whitelist needed)"
     return json.dumps(result)
 
 @app.route("/test-coze")
 def test_coze():
-    """Quick Coze connectivity test"""
     start = time.time()
-    answer = ask_coze("你好，请用一句话介绍自己", "test_user", timeout=20)
+    answer = ask_coze("你好，请用一句话介绍自己", "test_user")
     elapsed = round(time.time() - start, 1)
     if answer:
         return json.dumps({"ok": True, "answer": answer[:200], "elapsed_s": elapsed})
-    return json.dumps({"ok": False, "elapsed_s": elapsed, "note": "no answer or timeout"}), 500
+    return json.dumps({"ok": False, "elapsed_s": elapsed}), 500
 
 @app.route("/", methods=["GET", "POST"])
 @app.route("/wecom", methods=["GET", "POST"])
 def wecom():
     import xml.etree.ElementTree as ET
 
-    # ── URL验证 (GET) ──
     if request.method == "GET":
         echostr = request.args.get("echostr", "")
         logger.info(f"[VERIFY] echostr len={len(echostr)}")
@@ -229,7 +181,6 @@ def wecom():
             logger.exception(f"[VERIFY] failed: {e}")
             return "decrypt error", 500
 
-    # ── 接收消息 (POST) ──
     if request.method == "POST":
         try:
             root = ET.fromstring(request.data)
@@ -239,23 +190,30 @@ def wecom():
 
             msg_type  = msg.find("MsgType").text
             from_user = msg.find("FromUserName").text
-            to_user   = msg.find("ToUserName").text
+            msg_id_el = msg.find("MsgId")
+            msg_id    = msg_id_el.text if msg_id_el is not None else f"{from_user}_{int(time.time())}"
 
-            logger.info(f"[MSG] from={from_user} type={msg_type}")
+            logger.info(f"[MSG] from={from_user} type={msg_type} id={msg_id}")
 
             if msg_type == "text":
+                # Deduplicate WeCom retries
+                if is_duplicate(msg_id):
+                    logger.info(f"[MSG] duplicate {msg_id}, skipping")
+                    return "success", 200
+
                 content = msg.find("Content").text.strip()
                 logger.info(f"[MSG] content={content[:80]}")
 
-                # 同步调用Coze，直接在callback里回复，不需要IP白名单
-                answer = ask_coze(content, from_user, timeout=25)
+                def reply():
+                    answer = ask_coze(content, from_user)
+                    if answer:
+                        r = send_message(from_user, answer)
+                        if r and r.get("errcode") == 60020:
+                            logger.error(f"[SEND] IP blocked (60020). Current IP shown at /diag")
+                    else:
+                        send_message(from_user, "小助手暂时无法回复，请联系店长。")
 
-                if answer:
-                    logger.info(f"[REPLY] sync XML reply len={len(answer)}")
-                    return build_sync_reply(from_user, to_user, answer)
-                else:
-                    logger.warning("[REPLY] Coze failed, fallback API")
-                    send_message_api(from_user, "小助手暂时无法回复，请联系店长。")
+                threading.Thread(target=reply, daemon=True).start()
 
         except Exception as e:
             logger.exception(f"[POST] error: {e}")
