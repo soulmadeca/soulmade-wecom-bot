@@ -1,8 +1,10 @@
-#!/usr/bin/env python3
-"""WeCom <-> Coze AI bridge — async reply via WeCom API"""
+from gevent import monkey; monkey.patch_all()
 
-import hashlib, time, json, struct, base64, random, string, logging, requests, threading, os
-from flask import Flask, request
+#!/usr/bin/env python3
+"""WeCom <-> Coze AI bridge — gevent + sync XML reply (no IP whitelist needed)"""
+
+import hashlib, time, json, struct, base64, random, string, logging, requests, os
+from flask import Flask, request, Response
 from Crypto.Cipher import AES
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -24,146 +26,106 @@ COZE_API_URL = "https://api.coze.com/v3/chat"
 
 AES_KEY = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
 
-# ---------- AES ----------
 def _pkcs7_unpad(data):
     pad = data[-1]
     if pad == 0 or pad > 32:
-        raise ValueError(f"Invalid pad: {pad}")
+        raise ValueError(f"bad pad {pad}")
     return data[:-pad]
 
+def _pkcs7_pad(data):
+    pad_len = 32 - len(data) % 32
+    return data + bytes([pad_len] * pad_len)
+
 def wecom_decrypt(encrypt_b64):
-    encrypt_b64 = encrypt_b64.replace(" ", "+")
-    raw = base64.b64decode(encrypt_b64)
+    raw = base64.b64decode(encrypt_b64.replace(" ", "+"))
     cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_KEY[:16])
-    plain = _pkcs7_unpad(cipher.decrypt(raw))
-    plain = plain[16:]
+    plain = _pkcs7_unpad(cipher.decrypt(raw))[16:]
     msg_len = struct.unpack(">I", plain[:4])[0]
     return plain[4:4 + msg_len].decode("utf-8")
 
-# ---------- WeCom API ----------
-_token_cache = {"token": "", "expires": 0}
+def wecom_encrypt(plain_text):
+    rand = ''.join(random.choices(string.ascii_letters + string.digits, k=16)).encode()
+    pb = plain_text.encode("utf-8")
+    content = rand + struct.pack(">I", len(pb)) + pb + WECOM_CORP_ID.encode()
+    cipher = AES.new(AES_KEY, AES.MODE_CBC, AES_KEY[:16])
+    return base64.b64encode(cipher.encrypt(_pkcs7_pad(content))).decode()
 
-def get_access_token():
-    if time.time() < _token_cache["expires"] - 60:
-        return _token_cache["token"]
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}"
-    r = requests.get(url, timeout=10).json()
-    if r.get("errcode", 0) == 0:
-        _token_cache["token"] = r["access_token"]
-        _token_cache["expires"] = time.time() + r["expires_in"]
-        logger.info("[TOKEN] refreshed")
-    else:
-        logger.error(f"[TOKEN] error: {r}")
-    return _token_cache["token"]
+def wecom_sign(*args):
+    return hashlib.sha1("".join(sorted(args)).encode()).hexdigest()
 
-def send_message(to_user, content):
-    token = get_access_token()
-    url = f"https://qyapi.weixin.qq.com/cgi-bin/message/send?access_token={token}"
-    payload = {"touser": to_user, "msgtype": "text",
-               "agentid": WECOM_AGENT_ID, "text": {"content": content}}
-    r = requests.post(url, json=payload, timeout=10).json()
-    logger.info(f"[SEND] {r}")
-    return r
+def build_sync_reply(from_user, to_user, content):
+    ts = str(int(time.time()))
+    nonce = ''.join(random.choices(string.ascii_letters + string.digits, k=16))
+    plain_xml = (f"<xml><ToUserName><![CDATA[{from_user}]]></ToUserName>"
+                 f"<FromUserName><![CDATA[{to_user}]]></FromUserName>"
+                 f"<CreateTime>{ts}</CreateTime>"
+                 f"<MsgType><![CDATA[text]]></MsgType>"
+                 f"<Content><![CDATA[{content}]]></Content></xml>")
+    encrypt = wecom_encrypt(plain_xml)
+    sign = wecom_sign(WECOM_TOKEN, ts, nonce, encrypt)
+    xml = (f"<xml><Encrypt><![CDATA[{encrypt}]]></Encrypt>"
+           f"<MsgSignature><![CDATA[{sign}]]></MsgSignature>"
+           f"<TimeStamp>{ts}</TimeStamp>"
+           f"<Nonce><![CDATA[{nonce}]]></Nonce></xml>")
+    return Response(xml, content_type="application/xml")
 
-# ---------- Coze API ----------
 def ask_coze(question, user_id):
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "bot_id": COZE_BOT_ID,
-        "user_id": user_id,
-        "stream": True,
-        "auto_save_history": True,
-        "additional_messages": [{"role": "user", "content": question, "content_type": "text"}]
-    }
+    body = {"bot_id": COZE_BOT_ID, "user_id": user_id, "stream": True,
+            "auto_save_history": True,
+            "additional_messages": [{"role": "user", "content": question, "content_type": "text"}]}
     try:
         resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30, stream=True)
         if resp.status_code != 200:
             logger.error(f"[COZE] HTTP {resp.status_code}: {resp.text[:200]}")
             return None
         answer = ""
-        current_event = ""
-        for raw_line in resp.iter_lines():
-            if not raw_line:
-                continue
-            line = raw_line.decode("utf-8")
+        cur_event = ""
+        for raw in resp.iter_lines():
+            if not raw: continue
+            line = raw.decode("utf-8")
             if line.startswith("event:"):
-                current_event = line[6:].strip()
-                continue
+                cur_event = line[6:].strip(); continue
             if line.startswith("data:"):
-                data_str = line[5:].strip()
-                if data_str == "[DONE]":
-                    break
+                s = line[5:].strip()
+                if s == "[DONE]": break
                 try:
-                    data = json.loads(data_str)
-                    if (isinstance(data, dict) and
-                        current_event == "conversation.message.completed" and
-                        data.get("role") == "assistant" and
-                        data.get("type") == "answer"):
-                        content_val = data.get("content", "")
-                        if content_val:
-                            answer = content_val
-                            logger.info(f"[COZE] answer len={len(answer)}")
-                except Exception:
-                    pass
-        return answer if answer else None
+                    d = json.loads(s)
+                    if (isinstance(d, dict) and cur_event == "conversation.message.completed"
+                            and d.get("role") == "assistant" and d.get("type") == "answer"):
+                        v = d.get("content", "")
+                        if v: answer = v; logger.info(f"[COZE] len={len(v)}")
+                except Exception: pass
+        return answer or None
     except Exception as e:
-        logger.exception(f"[COZE] error: {e}")
+        logger.exception(f"[COZE] {e}")
         return None
 
-# ---------- Deduplication ----------
-_seen_msgs = {}
-_seen_lock = threading.Lock()
-
-def is_duplicate(msg_id):
-    """Return True if we already processed this message ID"""
-    now = time.time()
-    with _seen_lock:
-        # Clean old entries (>60s)
-        for k in list(_seen_msgs.keys()):
-            if now - _seen_msgs[k] > 60:
-                del _seen_msgs[k]
-        if msg_id in _seen_msgs:
-            return True
-        _seen_msgs[msg_id] = now
-        return False
-
-# ---------- Routes ----------
 @app.route("/health")
 def health():
-    return json.dumps({"status": "ok"})
+    return json.dumps({"status": "ok", "mode": "gevent+sync_xml"})
 
 @app.route("/diag")
 def diag():
-    result = {}
+    r = {}
     try:
-        import socket
-        result["hostname"] = socket.gethostname()
-    except Exception as e:
-        result["hostname_err"] = str(e)
+        import socket; r["host"] = socket.gethostname()
+    except: pass
     try:
-        ip = requests.get("https://api.ipify.org?format=json", timeout=5).json()
-        result["external_ip"] = ip.get("ip")
-    except Exception as e:
-        result["ip_err"] = str(e)
+        r["ip"] = requests.get("https://api.ipify.org?format=json", timeout=5).json().get("ip")
+    except Exception as e: r["ip_err"] = str(e)
     try:
-        tr = requests.get(
-            f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}",
-            timeout=10).json()
-        result["token_ok"] = tr.get("errcode", 0) == 0
-        result["token_errcode"] = tr.get("errcode", 0)
-    except Exception as e:
-        result["token_err"] = str(e)
-    result["coze_key_prefix"] = COZE_API_KEY[:12] + "..."
-    return json.dumps(result)
+        t = requests.get(f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}", timeout=10).json()
+        r["token_ok"] = t.get("errcode", 0) == 0
+    except Exception as e: r["token_err"] = str(e)
+    r["mode"] = "gevent+sync_xml (no IP whitelist needed)"
+    return json.dumps(r)
 
 @app.route("/test-coze")
 def test_coze():
-    start = time.time()
-    answer = ask_coze("你好，请用一句话介绍自己", "test_user")
-    elapsed = round(time.time() - start, 1)
-    if answer:
-        return json.dumps({"ok": True, "answer": answer[:200], "elapsed_s": elapsed})
-    return json.dumps({"ok": False, "elapsed_s": elapsed}), 500
+    t0 = time.time()
+    a = ask_coze("你好，一句话介绍自己", "test")
+    return json.dumps({"ok": bool(a), "answer": (a or "")[:200], "s": round(time.time()-t0, 1)})
 
 @app.route("/", methods=["GET", "POST"])
 @app.route("/wecom", methods=["GET", "POST"])
@@ -172,52 +134,34 @@ def wecom():
 
     if request.method == "GET":
         echostr = request.args.get("echostr", "")
-        logger.info(f"[VERIFY] echostr len={len(echostr)}")
         try:
             plain = wecom_decrypt(echostr)
             logger.info(f"[VERIFY] OK len={len(plain)}")
             return plain
         except Exception as e:
-            logger.exception(f"[VERIFY] failed: {e}")
-            return "decrypt error", 500
+            logger.exception(f"[VERIFY] fail: {e}")
+            return "error", 500
 
     if request.method == "POST":
         try:
             root = ET.fromstring(request.data)
-            encrypt = root.find("Encrypt").text
-            xml_str = wecom_decrypt(encrypt)
+            xml_str = wecom_decrypt(root.find("Encrypt").text)
             msg = ET.fromstring(xml_str)
-
             msg_type  = msg.find("MsgType").text
             from_user = msg.find("FromUserName").text
-            msg_id_el = msg.find("MsgId")
-            msg_id    = msg_id_el.text if msg_id_el is not None else f"{from_user}_{int(time.time())}"
-
-            logger.info(f"[MSG] from={from_user} type={msg_type} id={msg_id}")
-
+            to_user   = msg.find("ToUserName").text
+            logger.info(f"[MSG] from={from_user} type={msg_type}")
             if msg_type == "text":
-                # Deduplicate WeCom retries
-                if is_duplicate(msg_id):
-                    logger.info(f"[MSG] duplicate {msg_id}, skipping")
-                    return "success", 200
-
                 content = msg.find("Content").text.strip()
-                logger.info(f"[MSG] content={content[:80]}")
-
-                def reply():
-                    answer = ask_coze(content, from_user)
-                    if answer:
-                        r = send_message(from_user, answer)
-                        if r and r.get("errcode") == 60020:
-                            logger.error(f"[SEND] IP blocked (60020). Current IP shown at /diag")
-                    else:
-                        send_message(from_user, "小助手暂时无法回复，请联系店长。")
-
-                threading.Thread(target=reply, daemon=True).start()
-
+                logger.info(f"[MSG] {content[:60]}")
+                answer = ask_coze(content, from_user)
+                if answer:
+                    logger.info(f"[REPLY] sync XML len={len(answer)}")
+                    return build_sync_reply(from_user, to_user, answer)
+                else:
+                    return build_sync_reply(from_user, to_user, "小助手暂时无法回复，请联系店长。")
         except Exception as e:
-            logger.exception(f"[POST] error: {e}")
-
+            logger.exception(f"[POST] {e}")
         return "success", 200
 
 if __name__ == "__main__":
