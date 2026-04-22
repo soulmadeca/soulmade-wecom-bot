@@ -2,3 +2,4 @@ flask
 requests
 pycryptodome
 gunicorn
+gevent
