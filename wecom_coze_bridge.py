@@ -77,14 +77,18 @@ def ask_coze(question, user_id):
     chat_id = resp["data"]["id"]
     conv_id = resp["data"]["conversation_id"]
 
-    for i in range(30):
+    for i in range(90):
         time.sleep(1)
         poll = requests.get(
             f"https://api.coze.com/v3/chat/retrieve?chat_id={chat_id}&conversation_id={conv_id}",
             headers=headers, timeout=10
         ).json()
+        poll_code = poll.get("code", 0)
         status = poll.get("data", {}).get("status", "")
-        logger.info(f"[COZE] poll {i+1}: status={status}")
+        logger.info(f"[COZE] poll {i+1}: code={poll_code} status={status}")
+        if poll_code != 0:
+            logger.error(f"[COZE] poll error: {poll}")
+            return "AI service error. Please try again."
         if status == "completed":
             break
         if status in ("failed", "requires_action", "canceled"):
