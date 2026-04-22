@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """WeCom <-> Coze AI bridge service"""
-import hashlib, time, json, struct, base64, random, string, logging, requests, threading
+
+import hashlib, time, json, struct, base64, random, string, logging, requests, threading, os
 from flask import Flask, request
 from Crypto.Cipher import AES
 
@@ -16,9 +17,10 @@ WECOM_CORP_ID          = "ww1250414ed84f6f22"
 WECOM_AGENT_ID         = 1000002
 WECOM_CORP_SECRET      = "XxdI0vyDBr-WU0vlP5EE3k9VnEtcqnq4bG3lkHuqkPU"
 
-COZE_API_KEY  = "pat_eghsRFQVrQ8OKwZesNXwzrjgvSOcHrJWD8Qion4NzD6tzmlEqVwj58q15wtkHRHG"
-COZE_BOT_ID   = "7630679730714673205"
-COZE_API_URL  = "https://api.coze.com/v3/chat"
+COZE_API_KEY = os.environ.get('COZE_API_KEY', 'pat_eghsRFQVrQ8OKwZesNXwzrjgvSOcHrJWD8Qion4NzD6tzmlEqVwj58q15wtkHRHG')
+COZE_BOT_ID  = "7630679730714673205"
+COZE_API_URL = "https://api.coze.com/v3/chat"
+# ============================
 
 AES_KEY = base64.b64decode(WECOM_ENCODING_AES_KEY + "=")
 
@@ -61,53 +63,53 @@ def send_message(to_user, content):
     return r
 
 def ask_coze(question, user_id):
+    """Call Coze API using streaming mode — no polling needed."""
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
     body = {
-        "bot_id": COZE_BOT_ID, "user_id": user_id,
-        "stream": False, "auto_save_history": True,
+        "bot_id": COZE_BOT_ID,
+        "user_id": user_id,
+        "stream": True,
+        "auto_save_history": True,
         "additional_messages": [{"role": "user", "content": question, "content_type": "text"}]
     }
-    resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30).json()
-    logger.info(f"[COZE] code={resp.get('code')} status={resp.get('data',{}).get('status')}")
 
-    if resp.get("code") != 0:
-        logger.error(f"[COZE] error: {resp}")
-        return "AI service temporarily unavailable."
+    try:
+        resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30, stream=True)
+        if resp.status_code != 200:
+            logger.error(f"[COZE] HTTP {resp.status_code}: {resp.text[:200]}")
+            return "AI service temporarily unavailable."
 
-    chat_id = resp["data"]["id"]
-    conv_id = resp["data"]["conversation_id"]
+        answer = ""
+        for raw_line in resp.iter_lines():
+            if not raw_line:
+                continue
+            line = raw_line.decode("utf-8")
 
-    for i in range(90):
-        time.sleep(1)
-        poll = requests.get(
-            f"https://api.coze.com/v3/chat/retrieve?chat_id={chat_id}&conversation_id={conv_id}",
-            headers=headers, timeout=10
-        ).json()
-        poll_code = poll.get("code", 0)
-        status = poll.get("data", {}).get("status", "")
-        logger.info(f"[COZE] poll {i+1}: code={poll_code} status={status}")
-        if poll_code != 0:
-            logger.error(f"[COZE] poll error: {poll}")
-            return "AI service error. Please try again."
-        if status == "completed":
-            break
-        if status in ("failed", "requires_action", "canceled"):
-            return "AI processing failed."
-    else:
-        return "AI response timed out."
+            if line.startswith("event:"):
+                event = line[6:].strip()
+                logger.info(f"[COZE] event: {event}")
 
-    msgs = requests.get(
-        f"https://api.coze.com/v3/chat/message/list?chat_id={chat_id}&conversation_id={conv_id}",
-        headers=headers, timeout=10
-    ).json()
+            elif line.startswith("data:"):
+                data_str = line[5:].strip()
+                if data_str == "[DONE]":
+                    logger.info("[COZE] stream done")
+                    break
+                try:
+                    data = json.loads(data_str)
+                    # conversation.message.completed carries the full final answer
+                    if data.get("role") == "assistant" and data.get("type") == "answer":
+                        content_val = data.get("content", "")
+                        if content_val:
+                            answer = content_val
+                            logger.info(f"[COZE] answer len={len(answer)}")
+                except json.JSONDecodeError:
+                    pass
 
-    for m in msgs.get("data", []):
-        if m.get("role") == "assistant" and m.get("type") == "answer":
-            answer = m.get("content", "")
-            logger.info(f"[COZE] answer len={len(answer)}")
-            return answer
+        return answer if answer else "No response from AI."
 
-    return "No response from AI."
+    except Exception as e:
+        logger.exception(f"[COZE] streaming error: {e}")
+        return "AI service error. Please try again."
 
 @app.route("/health")
 def health():
@@ -115,7 +117,6 @@ def health():
 
 @app.route("/diag")
 def diag():
-    """Diagnostic endpoint: test token fetch and IP info"""
     result = {}
     try:
         import socket
@@ -136,6 +137,7 @@ def diag():
             result["token_prefix"] = token_resp["access_token"][:10] + "..."
     except Exception as e:
         result["token_err"] = str(e)
+    result["coze_key_prefix"] = COZE_API_KEY[:12] + "..."
     return json.dumps(result)
 
 @app.route("/", methods=["GET", "POST"])
@@ -159,6 +161,7 @@ def wecom():
             encrypt = root.find("Encrypt").text
             xml_str = wecom_decrypt(encrypt)
             msg = ET.fromstring(xml_str)
+
             msg_type  = msg.find("MsgType").text
             from_user = msg.find("FromUserName").text
             logger.info(f"[MSG] from={from_user} type={msg_type}")
@@ -166,14 +169,12 @@ def wecom():
             if msg_type == "text":
                 content = msg.find("Content").text.strip()
                 logger.info(f"[MSG] content={content[:80]}")
-
                 def reply():
                     try:
                         answer = ask_coze(content, from_user)
                         send_message(from_user, answer)
                     except Exception as ex:
                         logger.exception(f"[REPLY] error: {ex}")
-
                 threading.Thread(target=reply, daemon=True).start()
         except Exception as e:
             logger.exception(f"[POST] error: {e}")
