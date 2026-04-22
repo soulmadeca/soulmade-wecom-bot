@@ -63,7 +63,7 @@ def send_message(to_user, content):
     return r
 
 def ask_coze(question, user_id):
-    """Call Coze API using streaming mode — no polling needed."""
+    """Call Coze API using streaming mode. Only capture the final completed message."""
     headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
     body = {
         "bot_id": COZE_BOT_ID,
@@ -72,7 +72,6 @@ def ask_coze(question, user_id):
         "auto_save_history": True,
         "additional_messages": [{"role": "user", "content": question, "content_type": "text"}]
     }
-
     try:
         resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=30, stream=True)
         if resp.status_code != 200:
@@ -80,32 +79,40 @@ def ask_coze(question, user_id):
             return "AI service temporarily unavailable."
 
         answer = ""
+        current_event = ""
+
         for raw_line in resp.iter_lines():
             if not raw_line:
                 continue
             line = raw_line.decode("utf-8")
 
             if line.startswith("event:"):
-                event = line[6:].strip()
-                logger.info(f"[COZE] event: {event}")
+                current_event = line[6:].strip()
+                logger.info(f"[COZE] event: {current_event}")
+                continue
 
-            elif line.startswith("data:"):
+            if line.startswith("data:"):
                 data_str = line[5:].strip()
                 if data_str == "[DONE]":
                     logger.info("[COZE] stream done")
                     break
                 try:
                     data = json.loads(data_str)
-                    # conversation.message.completed carries the full final answer
-                    if data.get("role") == "assistant" and data.get("type") == "answer":
+                    if (isinstance(data, dict) and
+                        current_event == "conversation.message.completed" and
+                        data.get("role") == "assistant" and
+                        data.get("type") == "answer"):
                         content_val = data.get("content", "")
                         if content_val:
                             answer = content_val
                             logger.info(f"[COZE] answer len={len(answer)}")
-                except json.JSONDecodeError:
+                except Exception:
                     pass
 
-        return answer if answer else "No response from AI."
+        if answer:
+            return answer
+        logger.warning("[COZE] stream ended with no answer")
+        return "No response from AI."
 
     except Exception as e:
         logger.exception(f"[COZE] streaming error: {e}")
@@ -161,11 +168,9 @@ def wecom():
             encrypt = root.find("Encrypt").text
             xml_str = wecom_decrypt(encrypt)
             msg = ET.fromstring(xml_str)
-
             msg_type  = msg.find("MsgType").text
             from_user = msg.find("FromUserName").text
             logger.info(f"[MSG] from={from_user} type={msg_type}")
-
             if msg_type == "text":
                 content = msg.find("Content").text.strip()
                 logger.info(f"[MSG] content={content[:80]}")
