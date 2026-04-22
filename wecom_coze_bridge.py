@@ -109,6 +109,31 @@ def ask_coze(question, user_id):
 def health():
     return json.dumps({"status": "ok", "service": "WeCom-Coze Bridge"})
 
+@app.route("/diag")
+def diag():
+    """Diagnostic endpoint: test token fetch and IP info"""
+    result = {}
+    try:
+        import socket
+        result["hostname"] = socket.gethostname()
+    except Exception as e:
+        result["hostname_err"] = str(e)
+    try:
+        ip_resp = requests.get("https://api.ipify.org?format=json", timeout=5).json()
+        result["external_ip"] = ip_resp.get("ip", "unknown")
+    except Exception as e:
+        result["ip_err"] = str(e)
+    try:
+        token_url = f"https://qyapi.weixin.qq.com/cgi-bin/gettoken?corpid={WECOM_CORP_ID}&corpsecret={WECOM_CORP_SECRET}"
+        token_resp = requests.get(token_url, timeout=10).json()
+        result["token_errcode"] = token_resp.get("errcode", 0)
+        result["token_ok"] = token_resp.get("errcode", 0) == 0
+        if result["token_ok"]:
+            result["token_prefix"] = token_resp["access_token"][:10] + "..."
+    except Exception as e:
+        result["token_err"] = str(e)
+    return json.dumps(result)
+
 @app.route("/", methods=["GET", "POST"])
 @app.route("/wecom", methods=["GET", "POST"])
 def wecom():
