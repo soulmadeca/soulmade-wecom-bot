@@ -124,8 +124,22 @@ def diag():
 @app.route("/test-coze")
 def test_coze():
     t0 = time.time()
-    a = ask_coze("你好，一句话介绍自己", "test")
-    return json.dumps({"ok": bool(a), "answer": (a or "")[:200], "s": round(time.time()-t0, 1)})
+    headers = {"Authorization": f"Bearer {COZE_API_KEY}", "Content-Type": "application/json"}
+    body = {"bot_id": COZE_BOT_ID, "user_id": "test", "stream": True,
+            "auto_save_history": False,
+            "additional_messages": [{"role": "user", "content": "你好", "content_type": "text"}]}
+    try:
+        resp = requests.post(COZE_API_URL, headers=headers, json=body, timeout=15, stream=True)
+        if resp.status_code != 200:
+            return json.dumps({"ok": False, "http": resp.status_code, "body": resp.text[:400], "s": round(time.time()-t0,1)})
+        lines = []
+        for raw in resp.iter_lines():
+            if raw: lines.append(raw.decode("utf-8"))
+            if len(lines) > 30: break
+        a = ask_coze("你好，一句话介绍自己", "test")
+        return json.dumps({"ok": bool(a), "answer": (a or "")[:200], "s": round(time.time()-t0,1), "first_lines": lines[:5]})
+    except Exception as e:
+        return json.dumps({"ok": False, "error": str(e), "s": round(time.time()-t0,1)})
 
 @app.route("/", methods=["GET", "POST"])
 @app.route("/wecom", methods=["GET", "POST"])
